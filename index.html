@@ -188,8 +188,7 @@ input:focus,textarea:focus,select:focus{outline:1px solid var(--blue)}
     <div id="loginErr" class="login-err"></div>
 
     <div class="muted" style="margin-top:14px;font-size:10px">
-      Default owner: <b>Fxen</b> / <b>Fxen123!</b><br>
-      (Ubah password owner kapan saja dari Owner Panel.)
+      Default owner: <b>Fxen</b> / <b>Fxen123!</b>
     </div>
   </div>
 </section>
@@ -400,21 +399,19 @@ input:focus,textarea:focus,select:focus{outline:1px solid var(--blue)}
 const $ = id => document.getElementById(id);
 
 /* ==========================================================
-   AUTH / USER DATABASE (localStorage)
+   KONFIGURASI SUPABASE
    ========================================================== */
-const USERS_KEY    = "awz_users_v1";
-const SESSION_KEY  = "awz_session_v1";
-const ROLES        = ["owner", "ceo", "pt", "member"];
+const SUPABASE_URL  = "https://gajxfctqldchphpnmdfg.supabase.co";
+const SUPABASE_KEY  = "sb_publishable_ruL4WPZ3fpLHEMzD03m_FA_I8juOSVr";
+const SESSION_KEY   = "awz_session_v2";
+const ROLES         = ["owner", "ceo", "pt", "member"];
 
-const DEFAULT_USERS = [
-  { username: "Fxen",    password: "Fxen123!",   role: "owner"  },
-  { username: "member1", password: "member123",  role: "member" },
-  { username: "ceo1",    password: "ceo12345",   role: "ceo"    },
-  { username: "pt1",     password: "pt123456",   role: "pt"     }
-];
-
+let supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 let currentSession = null;
 
+/* ==========================================================
+   AUTH / USER DATABASE (SUPABASE)
+   ========================================================== */
 async function sha256(text) {
   const buf = new TextEncoder().encode(text);
   const hash = await crypto.subtle.digest("SHA-256", buf);
@@ -422,40 +419,19 @@ async function sha256(text) {
     .map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function loadUsers() {
-  let raw = localStorage.getItem(USERS_KEY);
-  if (raw) {
-    try { return JSON.parse(raw); } catch(e){ /* fallthrough */ }
-  }
-  const seeded = [];
-  for (const u of DEFAULT_USERS) {
-    seeded.push({
-      username: u.username,
-      role: u.role,
-      passHash: await sha256(u.password),
-      createdAt: new Date().toISOString(),
-      seeded: true
-    });
-  }
-  localStorage.setItem(USERS_KEY, JSON.stringify(seeded));
-  return seeded;
-}
-
-async function saveUsers(users) {
-  localStorage.setItem(USERS_KEY, JSON.stringify(users));
-}
-
-async function findUser(username) {
-  const users = await loadUsers();
-  return users.find(u => u.username === username) || null;
-}
-
 async function verifyLogin(username, password) {
-  const user = await findUser(username);
-  if (!user) return { ok:false, reason:"Username tidak terdaftar di database." };
+  const { data, error } = await supabaseClient
+    .from("app_users")
+    .select("*")
+    .eq("username", username)
+    .single();
+
+  if (error || !data) return { ok:false, reason:"Username tidak terdaftar di database." };
+  
   const hash = await sha256(password);
-  if (hash !== user.passHash) return { ok:false, reason:"Password salah." };
-  return { ok:true, user };
+  if (hash !== data.pass_hash) return { ok:false, reason:"Password salah." };
+  
+  return { ok:true, user: data };
 }
 
 function saveSession(user) {
@@ -496,8 +472,7 @@ function applyRoleUI(session) {
   }
   badge.textContent = session.username + " · " + session.role;
   badge.className = roleBadgeClass(session.role);
-  $("adminNavBtn").style.display =
-    session.role === "owner" ? "inline-block" : "none";
+  $("adminNavBtn").style.display = session.role === "owner" ? "inline-block" : "none";
 }
 
 function showLogin() {
@@ -547,7 +522,10 @@ async function doLogout() {
   if (supabaseClient) {
     try { supabaseClient.removeAllChannels(); } catch(e){}
     try { await supabaseClient.auth.signOut(); } catch(e){}
-    supabaseClient = null;
+    
+    // Re-init client karena auth signOut membersihkan state
+    supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    
     chatChannel = null;
     chatReady = false;
     const rt = $("rtMessages");
@@ -576,15 +554,24 @@ function openAdmin() {
 function closeAdmin() { $("adminPanel").classList.remove("open"); }
 
 async function refreshUserList() {
-  const users = await loadUsers();
   const box = $("userList");
   box.replaceChildren();
+  box.innerHTML = '<div class="empty">Memuat data user...</div>';
+
+  const { data: users, error } = await supabaseClient
+    .from("app_users")
+    .select("*")
+    .order("created_at", { ascending: true });
+
+  box.replaceChildren();
+
+  if (error) {
+    box.innerHTML = '<div class="empty err">Gagal memuat user: ' + error.message + '</div>';
+    return;
+  }
 
   if (!users.length) {
-    const e = document.createElement("div");
-    e.className = "empty";
-    e.textContent = "Belum ada user.";
-    box.appendChild(e);
+    box.innerHTML = '<div class="empty">Belum ada user.</div>';
     return;
   }
 
@@ -600,8 +587,7 @@ async function refreshUserList() {
     h.appendChild(b);
 
     const meta = document.createElement("p");
-    meta.textContent = "Dibuat: " + (u.createdAt || "-") +
-      (u.seeded ? " · (seed default)" : "");
+    meta.textContent = "Dibuat: " + new Date(u.created_at).toLocaleString("id-ID");
 
     card.append(h, meta);
 
@@ -619,16 +605,18 @@ async function refreshUserList() {
       del.className = "dangerbtn";
       del.textContent = "HAPUS USER";
       del.addEventListener("click", async () => {
-        const ownerCount = (await loadUsers()).filter(x => x.role === "owner").length;
-        if (u.role === "owner" && ownerCount <= 1) {
+        if (u.role === "owner" && users.filter(x => x.role === "owner").length <= 1) {
           $("adminMsg").textContent = "Tidak bisa menghapus owner terakhir.";
           return;
         }
-        const users2 = (await loadUsers()).filter(x => x.username !== u.username);
-        await saveUsers(users2);
-        $("adminMsg").textContent = "User " + u.username + " dihapus.";
-        log("OWNER: hapus user " + u.username, "warn");
-        refreshUserList();
+        const { error: delErr } = await supabaseClient.from("app_users").delete().eq("id", u.id);
+        if (delErr) {
+          $("adminMsg").textContent = "Gagal hapus: " + delErr.message;
+        } else {
+          $("adminMsg").textContent = "User " + u.username + " dihapus.";
+          log("OWNER: hapus user " + u.username, "warn");
+          refreshUserList();
+        }
       });
       btnRow.appendChild(del);
     }
@@ -677,13 +665,19 @@ async function refreshUserList() {
         pwMsg.textContent = "Konfirmasi password tidak sama."; return;
       }
 
-      const all = await loadUsers();
-      const idx = all.findIndex(x => x.username === u.username);
-      if (idx === -1) { pwMsg.textContent = "User tidak ditemukan."; return; }
+      saveBtn.disabled = true;
+      const newHash = await sha256(p1);
+      
+      const { error: updErr } = await supabaseClient
+        .from("app_users")
+        .update({ pass_hash: newHash })
+        .eq("id", u.id);
+        
+      saveBtn.disabled = false;
 
-      all[idx].passHash = await sha256(p1);
-      all[idx].seeded = false;
-      await saveUsers(all);
+      if (updErr) {
+        pwMsg.textContent = "Gagal update: " + updErr.message; return;
+      }
 
       pwMsg.style.color = "var(--green)";
       pwMsg.textContent = "Password diperbarui.";
@@ -720,19 +714,26 @@ async function addUser() {
     $("adminMsg").textContent = "Role tidak valid."; return;
   }
 
-  const users = await loadUsers();
-  if (users.some(u => u.username.toLowerCase() === username.toLowerCase())) {
-    $("adminMsg").textContent = "Username sudah terdaftar."; return;
+  $("addUserBtn").disabled = true;
+  const hash = await sha256(password);
+  
+  const { error } = await supabaseClient.from("app_users").insert({
+    username: username,
+    role: role,
+    pass_hash: hash
+  });
+  
+  $("addUserBtn").disabled = false;
+
+  if (error) {
+    if (error.code === "23505") { // Unique violation
+      $("adminMsg").textContent = "Username sudah terdaftar.";
+    } else {
+      $("adminMsg").textContent = "Gagal menambah user: " + error.message;
+    }
+    return;
   }
 
-  users.push({
-    username,
-    role,
-    passHash: await sha256(password),
-    createdAt: new Date().toISOString(),
-    seeded: false
-  });
-  await saveUsers(users);
   $("newUser").value = "";
   $("newPass").value = "";
   $("adminMsg").textContent = "User " + username + " (" + role + ") ditambahkan.";
@@ -1206,14 +1207,10 @@ document.querySelectorAll("[data-prompt]").forEach(button => {
 /* ==========================================================
    REALTIME CHAT + HISTORY (Supabase)
    ========================================================== */
-const SUPABASE_URL  = "https://gajxfctqldchphpnmdfg.supabase.co";
-const SUPABASE_KEY  = "sb_publishable_ruL4WPZ3fpLHEMzD03m_FA_I8juOSVr";
 const CHAT_TOPIC    = "chat:public";
 const HISTORY_LIMIT = 50;
-
-let supabaseClient = null;
-let chatChannel    = null;
-let chatReady      = false;
+let chatChannel     = null;
+let chatReady       = false;
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
@@ -1272,17 +1269,20 @@ async function initRealtimeChat() {
     setRtStatus("Library Supabase gagal dimuat.", "var(--red)");
     return;
   }
-  if (supabaseClient) return;
 
-  supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
-
-  const { error: authErr } = await supabaseClient.auth.signInAnonymously();
-  if (authErr) {
-    setRtStatus("Gagal auth: " + authErr.message, "var(--red)");
-    return;
+  // Auth anonymous untuk chat (jika belum)
+  const { data: { session } } = await supabaseClient.auth.getSession();
+  if (!session) {
+    const { error: authErr } = await supabaseClient.auth.signInAnonymously();
+    if (authErr) {
+      setRtStatus("Gagal auth: " + authErr.message, "var(--red)");
+      return;
+    }
   }
 
   await loadChatHistory();
+
+  if (chatChannel) supabaseClient.removeChannel(chatChannel);
 
   chatChannel = supabaseClient.channel(CHAT_TOPIC, {
     config: { private: true }
@@ -1428,8 +1428,6 @@ $("addUserBtn").addEventListener("click", addUser);
 
 /* BOOTSTRAP */
 (async function boot() {
-  await loadUsers();
-
   const session = loadSession();
   if (session) {
     currentSession = session;
@@ -1444,7 +1442,7 @@ $("addUserBtn").addEventListener("click", addUser);
 
   resetFindings();
   updateStats();
-  log("Analyzer siap. Login diperlukan.", "ok");
+  log("Analyzer siap. Login via Database.", "ok");
 })();
 </script>
 </body>
